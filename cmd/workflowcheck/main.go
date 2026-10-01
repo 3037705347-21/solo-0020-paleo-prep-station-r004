@@ -7,15 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"net/http/httptest"
 	"os"
-	"time"
 
+	"example.com/paleo-prep-station/internal/config"
 	"example.com/paleo-prep-station/internal/contracts"
-	"example.com/paleo-prep-station/internal/httpapi"
-	"example.com/paleo-prep-station/internal/repository"
-	"example.com/paleo-prep-station/internal/station"
 )
 
 type specimenView struct {
@@ -43,112 +40,124 @@ type releaseView struct {
 }
 
 func main() {
-	workflow := flag.String("workflow", "", "workflow id to check")
-	flag.Parse()
-
-	if err := run(*workflow); err != nil {
-		fmt.Fprintln(os.Stderr, "workflow check failed:", err)
-		os.Exit(1)
-	}
-	fmt.Printf("workflow check passed: %s\n", *workflow)
+	os.Exit(run(os.Args[1:]))
 }
 
-func run(workflow string) error {
-	handler := httpapi.NewRouter(station.New(repository.NewMemory()))
-	server := httptest.NewServer(handler)
-	defer server.Close()
-	client := &http.Client{Timeout: 5 * time.Second}
+func run(args []string) int {
+	cfg, err := config.LoadCheck(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 2
+	}
 
-	switch workflow {
-	case "register-specimen":
-		specimen, err := registerSpecimen(client, server.URL)
+	client := &http.Client{Timeout: cfg.Probe.RequestTimeout}
+	log.Printf("workflow check starting: workflow=%s %s", cfg.Workflow, cfg.Probe.Summary())
+
+	if err := execute(cfg, client); err != nil {
+		fmt.Fprintf(os.Stderr, "workflow check failed: workflow=%s %v\n", cfg.Workflow, err)
+		return 1
+	}
+	fmt.Printf("workflow check passed: %s (catalog_number=%s)\n", cfg.Workflow, cfg.Probe.CatalogNumber)
+	return 0
+}
+
+func execute(cfg config.CheckConfig, client *http.Client) error {
+	baseURL := cfg.Probe.BaseURL
+	catalogNumber := cfg.Probe.CatalogNumber
+
+	switch cfg.Workflow {
+	case config.WorkflowRegisterSpecimen:
+		specimen, err := registerSpecimen(client, baseURL, catalogNumber)
 		if err != nil {
-			return err
+			return fmt.Errorf("stage register-specimen/register: %w", err)
 		}
 		if specimen.Status != "registered" {
-			return fmt.Errorf("expected registered status, got %s", specimen.Status)
+			return fmt.Errorf("stage register-specimen/register: expected registered status, got %s", specimen.Status)
 		}
 		var fetched specimenView
-		if err := requestJSON(client, http.MethodGet, server.URL+"/specimens/"+specimen.ID, nil, http.StatusOK, &fetched); err != nil {
-			return err
+		if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimen.ID, nil, http.StatusOK, &fetched); err != nil {
+			return fmt.Errorf("stage register-specimen/read-back: %w", err)
 		}
 		if fetched.ID != specimen.ID {
-			return errors.New("registered specimen cannot be read back")
+			return fmt.Errorf("stage register-specimen/read-back: registered specimen cannot be read back")
 		}
 		return nil
 
-	case "approve-prep-plan":
-		specimen, err := registerSpecimen(client, server.URL)
+	case config.WorkflowApprovePrepPlan:
+		specimen, err := registerSpecimen(client, baseURL, catalogNumber)
 		if err != nil {
-			return err
+			return fmt.Errorf("stage approve-prep-plan/register: %w", err)
 		}
-		plan, err := createPlan(client, server.URL, specimen.ID)
+		plan, err := createPlan(client, baseURL, specimen.ID)
 		if err != nil {
-			return err
+			return fmt.Errorf("stage approve-prep-plan/create-plan: %w", err)
 		}
 		var approved planView
 		if err := requestJSON(
 			client,
 			http.MethodPost,
-			server.URL+"/plans/"+plan.ID+"/approval",
+			baseURL+"/plans/"+plan.ID+"/approval",
 			contracts.ApprovalRequest{ApprovedBy: "curator-lin"},
 			http.StatusOK,
 			&approved,
 		); err != nil {
-			return err
+			return fmt.Errorf("stage approve-prep-plan/approve: %w", err)
 		}
 		if approved.Status != "approved" {
-			return fmt.Errorf("expected approved plan, got %s", approved.Status)
+			return fmt.Errorf("stage approve-prep-plan/approve: expected approved plan, got %s", approved.Status)
 		}
 		var fetchedSpecimen specimenView
-		if err := requestJSON(client, http.MethodGet, server.URL+"/specimens/"+specimen.ID, nil, http.StatusOK, &fetchedSpecimen); err != nil {
-			return err
+		if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimen.ID, nil, http.StatusOK, &fetchedSpecimen); err != nil {
+			return fmt.Errorf("stage approve-prep-plan/read-specimen: %w", err)
 		}
 		if fetchedSpecimen.Status != "preparing" {
-			return fmt.Errorf("expected preparing specimen, got %s", fetchedSpecimen.Status)
+			return fmt.Errorf("stage approve-prep-plan/read-specimen: expected preparing specimen, got %s", fetchedSpecimen.Status)
 		}
 		return nil
 
-	case "log-preparation":
-		specimen, plan, err := completedPlanSetup(client, server.URL)
+	case config.WorkflowLogPreparation:
+		specimen, plan, err := completedPlanSetup(client, baseURL, catalogNumber)
 		if err != nil {
-			return err
+			return fmt.Errorf("stage log-preparation/setup: %w", err)
 		}
-		if err := recordProgress(client, server.URL, plan.ID, 35, "矩阵剥离"); err != nil {
-			return err
+		if err := recordProgress(client, baseURL, plan.ID, 35, "矩阵剥离"); err != nil {
+			return fmt.Errorf("stage log-preparation/progress-partial: %w", err)
 		}
-		if err := recordProgress(client, server.URL, plan.ID, 100, "表面加固"); err != nil {
-			return err
+		if err := recordProgress(client, baseURL, plan.ID, 100, "表面加固"); err != nil {
+			return fmt.Errorf("stage log-preparation/progress-final: %w", err)
 		}
 		var snapshot planSnapshot
-		if err := requestJSON(client, http.MethodGet, server.URL+"/plans/"+plan.ID, nil, http.StatusOK, &snapshot); err != nil {
-			return err
+		if err := requestJSON(client, http.MethodGet, baseURL+"/plans/"+plan.ID, nil, http.StatusOK, &snapshot); err != nil {
+			return fmt.Errorf("stage log-preparation/read-plan: %w", err)
 		}
 		if snapshot.Plan.Status != "completed" || len(snapshot.Progress) != 2 {
-			return errors.New("plan did not complete with exactly two progress entries")
+			return fmt.Errorf("stage log-preparation/read-plan: plan did not complete with exactly two progress entries")
 		}
 		var fetchedSpecimen specimenView
-		if err := requestJSON(client, http.MethodGet, server.URL+"/specimens/"+specimen.ID, nil, http.StatusOK, &fetchedSpecimen); err != nil {
-			return err
+		if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimen.ID, nil, http.StatusOK, &fetchedSpecimen); err != nil {
+			return fmt.Errorf("stage log-preparation/read-specimen: %w", err)
 		}
 		if fetchedSpecimen.Status != "stabilized" {
-			return fmt.Errorf("expected stabilized specimen, got %s", fetchedSpecimen.Status)
+			return fmt.Errorf("stage log-preparation/read-specimen: expected stabilized specimen, got %s", fetchedSpecimen.Status)
 		}
 		return nil
 
-	case "release-for-study":
-		specimen, plan, err := completedPlanSetup(client, server.URL)
+	case config.WorkflowReleaseForStudy:
+		specimen, plan, err := completedPlanSetup(client, baseURL, catalogNumber)
 		if err != nil {
-			return err
+			return fmt.Errorf("stage release-for-study/setup: %w", err)
 		}
-		if err := recordProgress(client, server.URL, plan.ID, 100, "表面加固"); err != nil {
-			return err
+		if err := recordProgress(client, baseURL, plan.ID, 100, "表面加固"); err != nil {
+			return fmt.Errorf("stage release-for-study/complete: %w", err)
 		}
 		var release releaseView
 		if err := requestJSON(
 			client,
 			http.MethodPost,
-			server.URL+"/specimens/"+specimen.ID+"/release",
+			baseURL+"/specimens/"+specimen.ID+"/release",
 			contracts.ReleaseRequest{
 				Purpose:    "比较解剖研究",
 				Recipient:  "地层研究组",
@@ -157,32 +166,32 @@ func run(workflow string) error {
 			http.StatusCreated,
 			&release,
 		); err != nil {
-			return err
+			return fmt.Errorf("stage release-for-study/release: %w", err)
 		}
 		if release.SpecimenID != specimen.ID {
-			return errors.New("release record references the wrong specimen")
+			return fmt.Errorf("stage release-for-study/release: release record references the wrong specimen")
 		}
 		var fetched specimenView
-		if err := requestJSON(client, http.MethodGet, server.URL+"/specimens/"+specimen.ID, nil, http.StatusOK, &fetched); err != nil {
-			return err
+		if err := requestJSON(client, http.MethodGet, baseURL+"/specimens/"+specimen.ID, nil, http.StatusOK, &fetched); err != nil {
+			return fmt.Errorf("stage release-for-study/read-specimen: %w", err)
 		}
 		if fetched.Status != "available" {
-			return fmt.Errorf("expected available specimen, got %s", fetched.Status)
+			return fmt.Errorf("stage release-for-study/read-specimen: expected available specimen, got %s", fetched.Status)
 		}
 		return nil
 	default:
-		return fmt.Errorf("unknown workflow %q", workflow)
+		return fmt.Errorf("stage config: unknown workflow %q", cfg.Workflow)
 	}
 }
 
-func registerSpecimen(client *http.Client, baseURL string) (specimenView, error) {
+func registerSpecimen(client *http.Client, baseURL, catalogNumber string) (specimenView, error) {
 	var specimen specimenView
 	err := requestJSON(
 		client,
 		http.MethodPost,
 		baseURL+"/specimens",
 		contracts.RegisterSpecimenRequest{
-			CatalogNumber: "PPS-2026-001",
+			CatalogNumber: catalogNumber,
 			FieldLabel:    "北坡-07",
 			TaxonHint:     "大型脊椎动物",
 			MatrixKind:    "粉砂岩",
@@ -212,8 +221,8 @@ func createPlan(client *http.Client, baseURL, specimenID string) (planView, erro
 	return plan, err
 }
 
-func completedPlanSetup(client *http.Client, baseURL string) (specimenView, planView, error) {
-	specimen, err := registerSpecimen(client, baseURL)
+func completedPlanSetup(client *http.Client, baseURL, catalogNumber string) (specimenView, planView, error) {
+	specimen, err := registerSpecimen(client, baseURL, catalogNumber)
 	if err != nil {
 		return specimenView{}, planView{}, err
 	}
