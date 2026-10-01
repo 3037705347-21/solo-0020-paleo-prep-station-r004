@@ -1,3 +1,8 @@
+// Command paleo-prep-station 是古生物修复制备台的 HTTP 进程入口。
+//
+// 监听地址、读写与空闲超时、关闭期限全部来自 internal/config 的显式配置
+// （flag 优先，PPS_* 环境变量次之，内置默认值兜底），进程生命周期按
+// listen/serve/shutdown 阶段上报失败，并映射到 server 包的固定退出码。
 package main
 
 import (
@@ -6,14 +11,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
+	"example.com/paleo-prep-station/internal/config"
 	"example.com/paleo-prep-station/internal/httpapi"
 	"example.com/paleo-prep-station/internal/repository"
+	"example.com/paleo-prep-station/internal/server"
 	"example.com/paleo-prep-station/internal/station"
 )
 
@@ -22,43 +27,33 @@ func main() {
 }
 
 func run() int {
-	addr := flag.String("addr", "127.0.0.1:18133", "local HTTP listen address")
-	flag.Parse()
-
-	repo := repository.NewMemory()
-	service := station.New(repo)
-	server := &http.Server{
-		Addr:              *addr,
-		Handler:           httpapi.NewRouter(service),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+	cfg := config.Default()
+	fs := flag.NewFlagSet("paleo-prep-station", flag.ContinueOnError)
+	if err := cfg.RegisterFlags(fs, os.Getenv); err != nil {
+		fmt.Fprintln(os.Stderr, "stage config:", err)
+		return server.ExitConfig
+	}
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return server.ExitOK
+		}
+		fmt.Fprintln(os.Stderr, "stage config:", err)
+		return server.ExitConfig
+	}
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintln(os.Stderr, "stage config:", err)
+		return server.ExitConfig
 	}
 
+	log.Printf("effective config: %s", cfg.String())
+
+	handler := httpapi.NewRouter(station.New(repository.NewMemory()))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- server.ListenAndServe()
-	}()
-
-	log.Printf("paleo prep station listening on %s", *addr)
-	select {
-	case err := <-errCh:
-		if errors.Is(err, http.ErrServerClosed) {
-			return 0
-		}
-		fmt.Fprintln(os.Stderr, "server stopped:", err)
-		return 1
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			fmt.Fprintln(os.Stderr, "server shutdown:", err)
-			return 1
-		}
-		return 0
+	if err := server.Run(ctx, cfg.Server, handler, log.Printf, nil); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return server.ExitCode(err)
 	}
+	return server.ExitOK
 }
